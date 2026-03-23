@@ -271,6 +271,48 @@ async def uh():
         return {"status":"ok","uploads":[{k:(v.isoformat() if hasattr(v,'isoformat') else v) for k,v in dict(r).items()} for r in rows]}
     except Exception as e: return {"status":"error","detail":str(e)}
 
+@app.get("/api/v2/admin/user-behavior",dependencies=[Depends(verify_admin)])
+async def user_behavior(limit:int=50):
+    """Fetch recent user behavior data (quote inputs) for admin dashboard."""
+    if not db_pool: return {"status":"no_db","records":[]}
+    try:
+        rows=await db_pool.fetch("""
+            SELECT quote_ref, created_at, age, gender, country, region, smoking, exercise,
+                   occupation, preexist_count, ipd_tier, include_opd, include_dental,
+                   include_maternity, family_size
+            FROM hp_user_behavior ORDER BY created_at DESC LIMIT $1
+        """, min(limit, 200))
+        records = []
+        for r in rows:
+            d = dict(r)
+            for k,v in d.items():
+                if hasattr(v, 'isoformat'): d[k] = v.isoformat()
+            records.append(d)
+        # Summary stats
+        total = len(records)
+        summary = {}
+        if total > 0:
+            ages = [r["age"] for r in records if r.get("age")]
+            summary = {
+                "total_quotes": total,
+                "avg_age": round(sum(ages)/len(ages),1) if ages else 0,
+                "tier_distribution": {},
+                "rider_rates": {"opd":0,"dental":0,"maternity":0},
+                "smoking_distribution": {},
+            }
+            for r in records:
+                t = r.get("ipd_tier","Unknown")
+                summary["tier_distribution"][t] = summary["tier_distribution"].get(t,0)+1
+                s = r.get("smoking","Unknown")
+                summary["smoking_distribution"][s] = summary["smoking_distribution"].get(s,0)+1
+                if r.get("include_opd"): summary["rider_rates"]["opd"]+=1
+                if r.get("include_dental"): summary["rider_rates"]["dental"]+=1
+                if r.get("include_maternity"): summary["rider_rates"]["maternity"]+=1
+            for k in summary["rider_rates"]:
+                summary["rider_rates"][k] = round(summary["rider_rates"][k]/total*100,1)
+        return {"status":"ok","records":records,"summary":summary}
+    except Exception as e: return {"status":"error","detail":str(e)}
+
 @app.exception_handler(Exception)
 async def err(request:Request,exc:Exception):
     rid=getattr(request.state,"rid","?") if hasattr(request,"state") else "?"
