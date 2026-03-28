@@ -4,11 +4,11 @@ Fixes: auth, rate limiting, cross-country region validation, input sanitization,
 deterministic encoding, champion/challenger, severity clamping, premium bounds,
 batch inserts, request ID correlation, error handling.
 """
-import os, re, time, uuid, logging, json
+import os, re, time, uuid, logging, json, hashlib, secrets
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from typing import Optional, List
-from collections import defaultdict
+from collections import defaultdict, deque
 import joblib, numpy as np
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,6 +35,15 @@ MODEL_DIR=os.getenv("MODEL_DIR","models")
 ALLOWED_ORIGINS=os.getenv("ALLOWED_ORIGINS","*").split(",")
 ADMIN_KEY=os.getenv("ADMIN_API_KEY","")
 db_pool=None; models={}; model_version="v1.0.0"
+
+# ── Anti-scraping protection ──────────────────────────────────────────────────
+DAILY_LIMIT = int(os.getenv("DAILY_QUOTE_LIMIT", "15"))
+SESSION_QUOTE_LIMIT = int(os.getenv("SESSION_QUOTE_LIMIT", "10"))
+SWEEP_THRESHOLD = int(os.getenv("SWEEP_THRESHOLD", "5"))
+_sessions: dict = {}          # token → {email, browser_id, uses_remaining, created_at}
+_daily_quotes: dict = defaultdict(lambda: {"date": None, "count": 0})
+_probe_buffer: dict = defaultdict(lambda: deque(maxlen=20))
+SWEEP_FIELDS = ["age", "gender", "smoking_status", "exercise_frequency", "occupation_type", "ipd_tier"]
 
 # Rate limiter
 _buckets=defaultdict(lambda:{"t":30,"last":time.monotonic()})
@@ -78,6 +87,26 @@ async def lifespan(app):
     if _db_p:
         try: db_pool=await asyncpg.create_pool(host=_db_p["host"],port=_db_p["port"],user=_db_p["user"],password=_db_p["password"],database=_db_p["database"],min_size=1,max_size=5,command_timeout=10,timeout=10,ssl="require"); log.info("DB connected")
         except Exception as e: log.warning(f"DB failed: {e}")
+        try:
+            await db_pool.execute("""
+                ALTER TABLE hp_user_behavior
+                    ADD COLUMN IF NOT EXISTS browser_id TEXT,
+                    ADD COLUMN IF NOT EXISTS email TEXT,
+                    ADD COLUMN IF NOT EXISTS anomaly_flag BOOLEAN DEFAULT FALSE;
+            """)
+            await db_pool.execute("""
+                CREATE TABLE IF NOT EXISTS hp_sessions (
+                    id SERIAL PRIMARY KEY,
+                    token_hash TEXT UNIQUE NOT NULL,
+                    email TEXT NOT NULL,
+                    browser_id TEXT,
+                    uses_remaining INT DEFAULT 10,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+            log.info("Schema migration OK")
+        except Exception as e:
+            log.warning(f"Schema migration: {e}")
     yield
     if db_pool: await db_pool.close()
 
@@ -97,6 +126,8 @@ class PricingRequest(BaseModel):
     preexist_conditions:List[str]=Field(default_factory=lambda:["None"])
     ipd_tier:str=Field("Silver"); family_size:int=Field(1,ge=1,le=10)
     include_opd:bool=False; include_dental:bool=False; include_maternity:bool=False
+    browser_id: Optional[str] = Field(None)
+    email: Optional[str] = Field(None)
 
     @field_validator("gender")
     @classmethod
@@ -151,22 +182,127 @@ def _fb_s(c,feat):
 
 def _qid(): return f"HP-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
 
+# ── Layer 1: daily quota per browser_id ──────────────────────────────────────
+def _check_daily(browser_id: str) -> bool:
+    today = datetime.now(timezone.utc).date().isoformat()
+    b = _daily_quotes[browser_id]
+    if b["date"] != today:
+        b["date"] = today; b["count"] = 0
+    b["count"] += 1
+    return b["count"] <= DAILY_LIMIT
+
+# ── Layer 3: parameter-sweep anomaly detection ────────────────────────────────
+def _detect_sweep(browser_id: str, req) -> bool:
+    sig = {f: getattr(req, f) for f in SWEEP_FIELDS}
+    sig["conditions"] = tuple(sorted(req.preexist_conditions))
+    buf = _probe_buffer[browser_id]
+    buf.append(sig)
+    if len(buf) < SWEEP_THRESHOLD:
+        return False
+    recent = list(buf)[-SWEEP_THRESHOLD:]
+    all_fields = list(recent[0].keys())
+    for vf in all_fields:
+        others_same = all(
+            all(r[f] == recent[0][f] for f in all_fields if f != vf)
+            for r in recent[1:]
+        )
+        if others_same and len({r[vf] for r in recent}) > 1:
+            return True
+    return False
+
+# ── Layers 2+4: output banding + noise ───────────────────────────────────────
+def _apply_banding(res: dict) -> dict:
+    def band(v: float) -> float:
+        noise = 1 + (secrets.randbelow(11) - 5) / 100   # ±5%
+        return float(max(P_FLOOR, round(v * noise / 25) * 25))
+
+    if "ipd_core" in res:
+        ap = band(res["ipd_core"]["annual_premium"])
+        res["ipd_core"]["annual_premium"] = ap
+        res["ipd_core"]["monthly_premium"] = round(ap / 12, 2)
+
+    rtot = 0.0
+    for cov in res.get("riders", {}):
+        rp = band(res["riders"][cov]["annual_premium"])
+        res["riders"][cov]["annual_premium"] = rp
+        res["riders"][cov]["monthly_premium"] = round(rp / 12, 2)
+        rtot += rp
+
+    ipd_ap = res["ipd_core"]["annual_premium"] if "ipd_core" in res else 0.0
+    ff = res.get("family_factor", 1.0)
+    fs = res.get("family_size", 1)
+    total = round(float(np.clip((ipd_ap + rtot) * ff, P_FLOOR, P_CEIL * fs)), 2)
+    res["total_annual_premium"] = total
+    res["total_monthly_premium"] = round(total / 12, 2)
+    res["total_before_family"] = round(ipd_ap + rtot, 2)
+    res["quote_banded"] = True
+    return res
+
 async def _log_q(qid,inp,res):
     if not db_pool: return
     try: await db_pool.execute("INSERT INTO hp_quote_log(quote_ref,input_json,result_json,model_version)VALUES($1,$2::jsonb,$3::jsonb,$4)",qid,json.dumps(inp,default=str),json.dumps(res,default=str),model_version)
     except Exception as e: log.warning(f"Log fail: {e}")
 
-async def _log_b(qid,req):
+async def _log_b(qid, req, browser_id: str = "", email: str = "", anomaly_flag: bool = False):
     if not db_pool: return
-    try: await db_pool.execute("INSERT INTO hp_user_behavior(quote_ref,age,gender,country,region,smoking,exercise,occupation,preexist_count,ipd_tier,include_opd,include_dental,include_maternity,family_size)VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",qid,req.age,req.gender,req.country,req.region,req.smoking_status,req.exercise_frequency,req.occupation_type,len([p for p in req.preexist_conditions if p!="None"]),req.ipd_tier,req.include_opd,req.include_dental,req.include_maternity,req.family_size)
+    try: await db_pool.execute(
+        "INSERT INTO hp_user_behavior(quote_ref,age,gender,country,region,smoking,exercise,occupation,preexist_count,ipd_tier,include_opd,include_dental,include_maternity,family_size,browser_id,email,anomaly_flag)VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
+        qid,req.age,req.gender,req.country,req.region,req.smoking_status,req.exercise_frequency,req.occupation_type,len([p for p in req.preexist_conditions if p!="None"]),req.ipd_tier,req.include_opd,req.include_dental,req.include_maternity,req.family_size,browser_id,email,anomaly_flag)
     except Exception as e: log.warning(f"Beh fail: {e}")
 
 @app.get("/health")
 async def health():
     return {"status":"healthy","service":"DAC HealthPrice v2.1","models_loaded":list(models.keys()),"model_version":model_version,"database_connected":db_pool is not None,"countries":list(CTY_REG.keys()),"timestamp":datetime.now(timezone.utc).isoformat()}
 
+# ── Layer 6: session token dependency ────────────────────────────────────────
+async def verify_session(x_session_token: Optional[str] = Header(None)):
+    if not x_session_token:
+        raise HTTPException(401, "Session token required. Call POST /api/v2/session with your email first.")
+    if x_session_token not in _sessions:
+        raise HTTPException(401, "Invalid or expired session token.")
+    sess = _sessions[x_session_token]
+    if sess["uses_remaining"] <= 0:
+        _sessions.pop(x_session_token, None)
+        raise HTTPException(429, "Session quota exhausted. Request a new session.")
+    return x_session_token
+
+# ── Layer 5: email gate — issue session token ─────────────────────────────────
+class SessionRequest(BaseModel):
+    email: str
+    browser_id: Optional[str] = None
+
+@app.post("/api/v2/session")
+async def create_session(body: SessionRequest):
+    e = body.email.strip().lower()
+    if not e or "@" not in e or "." not in e.split("@")[-1]:
+        raise HTTPException(400, "Valid email address required.")
+    token = secrets.token_urlsafe(32)
+    _sessions[token] = {
+        "email": e,
+        "browser_id": body.browser_id or "",
+        "uses_remaining": SESSION_QUOTE_LIMIT,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if db_pool:
+        try:
+            await db_pool.execute(
+                "INSERT INTO hp_sessions(token_hash,email,browser_id,uses_remaining) VALUES($1,$2,$3,$4)",
+                hashlib.sha256(token.encode()).hexdigest(), e, body.browser_id or "", SESSION_QUOTE_LIMIT
+            )
+        except Exception as ex:
+            log.warning(f"Session log fail: {ex}")
+    log.info(f"Session created for {e[:3]}***@{e.split('@')[-1]}")
+    return {"token": token, "quotes_remaining": SESSION_QUOTE_LIMIT, "expires_in": 3600}
+
 @app.post("/api/v2/price")
-async def calc(req:PricingRequest,request:Request):
+async def calc(req: PricingRequest, request: Request, _tok: str = Depends(verify_session)):
+    bid = req.browser_id or request.client.host or "anon"
+    if not _check_daily(bid):
+        raise HTTPException(429, f"Daily quote limit ({DAILY_LIMIT}) reached for this device.")
+    is_sweep = _detect_sweep(bid, req)
+    if is_sweep:
+        log.warning(f"Sweep detected: browser_id={bid} email={_sessions.get(_tok,{}).get('email','?')}")
+
     t0=time.monotonic();feat=_enc(req);qid=_qid();rid=getattr(request.state,"rid","?")
     ipd=_predict("ipd",feat);tier=TIERS[req.ipd_tier];tf=T_F[req.ipd_tier];ld=COV["ipd"]["load"]
     ipd_loaded=round(ipd["expected_annual_cost"]*(1+ld)*tf,2)
@@ -185,8 +321,13 @@ async def calc(req:PricingRequest,request:Request):
         "riders":riders,"family_size":req.family_size,"family_factor":ff,"total_before_family":pre_fam,"total_annual_premium":total,"total_monthly_premium":round(total/12,2),
         "risk_profile":{"age":req.age,"gender":req.gender,"smoking":req.smoking_status,"exercise":req.exercise_frequency,"occupation":req.occupation_type,"preexist_conditions":req.preexist_conditions,"preexist_count":len([p for p in req.preexist_conditions if p!="None"])},
         "calculated_at":datetime.now(timezone.utc).isoformat()}
-    await _log_q(qid,req.model_dump(),res);await _log_b(qid,req)
-    ms=round((time.monotonic()-t0)*1000,1);log.info(f"[{rid}] {qid}|{req.ipd_tier}+{'+'.join(riders)or'none'}|age={req.age}|${total:,.0f}/yr|{ms}ms")
+
+    res = _apply_banding(res)
+    _sessions[_tok]["uses_remaining"] -= 1
+
+    await _log_q(qid,req.model_dump(),res)
+    await _log_b(qid, req, bid, req.email or _sessions.get(_tok,{}).get("email",""), is_sweep)
+    ms=round((time.monotonic()-t0)*1000,1);log.info(f"[{rid}] {qid}|{req.ipd_tier}+{'+'.join(riders) or 'none'}|age={req.age}|${total:,.0f}/yr|sweep={is_sweep}|{ms}ms")
     return res
 
 @app.get("/api/v2/reference")
