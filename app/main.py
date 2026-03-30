@@ -34,6 +34,8 @@ _db_p=_parse_db_url(os.getenv("DATABASE_URL",""))
 MODEL_DIR=os.getenv("MODEL_DIR","models")
 ALLOWED_ORIGINS=os.getenv("ALLOWED_ORIGINS","*").split(",")
 ADMIN_KEY=os.getenv("ADMIN_API_KEY","")
+CF_SECRET=os.getenv("CF_SECRET_TOKEN","")  # Cloudflare secret header — set in Render dashboard
+MAX_BODY=int(os.getenv("MAX_BODY_BYTES","65536"))  # 64KB default
 db_pool=None; models={}; model_version="v1.0.0"
 model_meta={"version":"v1.0.0","last_retrained_at":None,"training_dataset":None,"coverage":None,"r2":None}
 _fallback_models={}   # GLM fallback — consistent methodology with main models
@@ -56,7 +58,8 @@ def _rl(ip):
     return False
 
 async def verify_admin(x_api_key:str=Header(None)):
-    if ADMIN_KEY and x_api_key!=ADMIN_KEY: raise HTTPException(403,"Invalid API key")
+    if not ADMIN_KEY: raise HTTPException(503,"Admin not configured — set ADMIN_API_KEY env var")
+    if x_api_key!=ADMIN_KEY: raise HTTPException(403,"Invalid API key")
 
 VALID_GENDERS=["Male","Female","Other"]
 VALID_SMOKING=["Never","Former","Current"]
@@ -166,9 +169,24 @@ app.add_middleware(CORSMiddleware,allow_origins=ALLOWED_ORIGINS,allow_credential
 @app.middleware("http")
 async def mw(request:Request,call_next):
     ip=request.client.host if request.client else "x"
+    # Block direct access — only allow requests that came through Cloudflare
+    if CF_SECRET and request.headers.get("X-CF-Secret")!=CF_SECRET:
+        return JSONResponse(status_code=403,content={"detail":"Direct API access not permitted. Use the official frontend."})
+    # Rate limit
     if not _rl(ip): return JSONResponse(429,{"detail":"Rate limit exceeded"})
+    # Body size guard
+    cl=request.headers.get("content-length")
+    if cl and int(cl)>MAX_BODY: return JSONResponse(413,{"detail":"Payload too large"})
     request.state.rid=str(uuid.uuid4())[:12]
-    r=await call_next(request); r.headers["X-Request-ID"]=request.state.rid; return r
+    r=await call_next(request)
+    # Security headers
+    r.headers["X-Request-ID"]=request.state.rid
+    r.headers["X-Content-Type-Options"]="nosniff"
+    r.headers["X-Frame-Options"]="DENY"
+    r.headers["Strict-Transport-Security"]="max-age=31536000; includeSubDomains"
+    r.headers["Referrer-Policy"]="strict-origin-when-cross-origin"
+    r.headers["X-Permitted-Cross-Domain-Policies"]="none"
+    return r
 
 class PricingRequest(BaseModel):
     age:int=Field(...,ge=0,le=100); gender:str=Field(...); country:str=Field("cambodia"); region:str=Field(...)
