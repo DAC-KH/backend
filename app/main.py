@@ -19,18 +19,7 @@ import asyncpg
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"),format="%(asctime)s | %(levelname)-7s | %(message)s",datefmt="%H:%M:%S")
 log = logging.getLogger("hp")
 
-def _parse_db_url(url):
-    if not url: return {}
-    url=url.strip()
-    b=re.sub(r'^postgresql(\+\w+)?://','',url)
-    b=re.sub(r'^postgres://','',b)
-    m=re.match(r'^([^:]+):(.+)@([^:/@]+):(\d+)/(.+)$',b)
-    if m: return {"user":m[1],"password":m[2],"host":m[3],"port":int(m[4]),"database":m[5]}
-    m=re.match(r'^([^:]+):(.+)@([^:/@]+)/(.+)$',b)
-    if m: return {"user":m[1],"password":m[2],"host":m[3],"port":5432,"database":m[4]}
-    return {}
-
-_db_p=_parse_db_url(os.getenv("DATABASE_URL",""))
+_DATABASE_URL=os.getenv("DATABASE_URL","")
 MODEL_DIR=os.getenv("MODEL_DIR","models")
 ALLOWED_ORIGINS=os.getenv("ALLOWED_ORIGINS","*").split(",")
 ADMIN_KEY=os.getenv("ADMIN_API_KEY","")
@@ -107,7 +96,7 @@ def _fit_fallback_models():
         log.warning(f"Fallback GLM fit failed: {e}"); return {}
 
 @asynccontextmanager
-async def lifespan(app):
+async def lifespan(app):d
     global db_pool,models,model_version,model_meta,_fallback_models
     # Load primary ML models
     for c in ["ipd","opd","dental","maternity"]:
@@ -121,10 +110,11 @@ async def lifespan(app):
     log.info(f"Models: {list(models.keys())} ({model_version})")
     # Always fit fallback GLMs for consistent methodology
     _fallback_models=_fit_fallback_models()
-    # Database
-    if _db_p:
+    # Database — connect via raw DSN to preserve pooler usernames like postgres.xxxx
+    if _DATABASE_URL:
         try:
-            db_pool=await asyncpg.create_pool(host=_db_p["host"],port=_db_p["port"],user=_db_p["user"],password=_db_p["password"],database=_db_p["database"],min_size=1,max_size=5,command_timeout=10,timeout=10,ssl="require")
+            dsn=_DATABASE_URL.replace("postgres://","postgresql://",1)
+            db_pool=await asyncpg.create_pool(dsn=dsn,min_size=1,max_size=5,command_timeout=10,timeout=10,ssl="require")
             log.info("DB connected")
         except Exception as e: log.warning(f"DB failed: {e}")
         if db_pool:
