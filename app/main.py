@@ -96,7 +96,7 @@ def _fit_fallback_models():
         log.warning(f"Fallback GLM fit failed: {e}"); return {}
 
 @asynccontextmanager
-async def lifespan(app):d
+async def lifespan(app):
     global db_pool,models,model_version,model_meta,_fallback_models
     # Load primary ML models
     for c in ["ipd","opd","dental","maternity"]:
