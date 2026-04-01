@@ -120,17 +120,39 @@ async def lifespan(app):
         if db_pool:
             try:
                 await db_pool.execute("""
-                    ALTER TABLE hp_user_behavior
-                        ADD COLUMN IF NOT EXISTS browser_id TEXT,
-                        ADD COLUMN IF NOT EXISTS email TEXT,
-                        ADD COLUMN IF NOT EXISTS anomaly_flag BOOLEAN DEFAULT FALSE;
-                    ALTER TABLE hp_quote_log
-                        ADD COLUMN IF NOT EXISTS underwriting_status TEXT,
-                        ADD COLUMN IF NOT EXISTS used_fallback BOOLEAN DEFAULT FALSE,
-                        ADD COLUMN IF NOT EXISTS browser_id TEXT,
-                        ADD COLUMN IF NOT EXISTS email TEXT;
-                """)
-                await db_pool.execute("""
+                    CREATE TABLE IF NOT EXISTS hp_quote_log (
+                        id SERIAL PRIMARY KEY,
+                        quote_ref TEXT UNIQUE NOT NULL,
+                        input_json JSONB,
+                        result_json JSONB,
+                        model_version TEXT,
+                        underwriting_status TEXT,
+                        used_fallback BOOLEAN DEFAULT FALSE,
+                        browser_id TEXT,
+                        email TEXT,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                    CREATE TABLE IF NOT EXISTS hp_user_behavior (
+                        id SERIAL PRIMARY KEY,
+                        quote_ref TEXT,
+                        age INT,
+                        gender TEXT,
+                        country TEXT,
+                        region TEXT,
+                        smoking TEXT,
+                        exercise TEXT,
+                        occupation TEXT,
+                        preexist_count INT,
+                        ipd_tier TEXT,
+                        include_opd BOOLEAN,
+                        include_dental BOOLEAN,
+                        include_maternity BOOLEAN,
+                        family_size INT,
+                        browser_id TEXT,
+                        email TEXT,
+                        anomaly_flag BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    );
                     CREATE TABLE IF NOT EXISTS hp_sessions (
                         id SERIAL PRIMARY KEY,
                         token_hash TEXT UNIQUE NOT NULL,
